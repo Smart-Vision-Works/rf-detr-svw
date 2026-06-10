@@ -98,24 +98,15 @@ class COCOEvalCallback(Callback):
         # Separate metric for the EMA model; created lazily in on_validation_batch_end.
         self.map_metric_ema: Any = None
 
-    def on_fit_start(self, trainer: Any, pl_module: Any) -> None:
-        """Pull class names from the DataModule once the datasets are set up.
-
-        Builds a ``category_id → name`` mapping from the COCO annotation
-        metadata so that per-class AP is logged under the class name regardless
-        of whether the dataset uses sequential or non-sequential category IDs.
-
-        Args:
-            trainer: The PTL Trainer.
-            pl_module: The LightningModule.
-        """
+    def _bind_coco_category_names(self, trainer: Any) -> None:
+        """Populate ``_class_names`` / ``_cat_id_to_name`` from the DataModule COCO handle."""
         dm = trainer.datamodule
         if dm is None:
             return
         if hasattr(dm, "class_names"):
             self._class_names = dm.class_names or []
         # Build cat_id → name from the COCO annotation object when available.
-        for attr in ("_dataset_train", "_dataset_val"):
+        for attr in ("_dataset_train", "_dataset_val", "_dataset_test"):
             dataset = getattr(dm, attr, None)
             if dataset is None:
                 continue
@@ -134,6 +125,23 @@ class COCOEvalCallback(Callback):
                 return
         # Fallback: treat class_names as 0-based sequential labels.
         self._cat_id_to_name = {i: name for i, name in enumerate(self._class_names)}
+
+    def on_fit_start(self, trainer: Any, pl_module: Any) -> None:
+        """Pull class names from the DataModule once the datasets are set up.
+
+        Builds a ``category_id → name`` mapping from the COCO annotation
+        metadata so that per-class AP is logged under the class name regardless
+        of whether the dataset uses sequential or non-sequential category IDs.
+
+        Args:
+            trainer: The PTL Trainer.
+            pl_module: The LightningModule.
+        """
+        self._bind_coco_category_names(trainer)
+
+    def on_test_start(self, trainer: Any, pl_module: Any) -> None:
+        """``trainer.test()`` does not call ``on_fit_start``; bind COCO names from the test split."""
+        self._bind_coco_category_names(trainer)
 
     def on_validation_batch_end(
         self,
@@ -160,7 +168,8 @@ class COCOEvalCallback(Callback):
             batch: The device-transferred batch ``(samples, targets)``.
             batch_idx: Batch index within the validation epoch.
         """
-        preds: list[dict[str, torch.Tensor]] = self._convert_preds(outputs["results"])
+        preds = self._align_pred_labels_to_targets(outputs["results"], outputs["targets"])
+        preds = self._convert_preds(preds)
         targets = self._convert_targets(outputs["targets"])
 
         self.map_metric.update(preds, targets)
@@ -188,7 +197,8 @@ class COCOEvalCallback(Callback):
                 ema_underlying.eval()  # AveragedModel deepcopy is not managed by PTL
                 ema_outputs = ema_underlying(samples)
                 ema_results = pl_module.postprocess(ema_outputs, orig_sizes)
-            ema_preds = self._convert_preds(ema_results)
+            ema_preds = self._align_pred_labels_to_targets(ema_results, outputs["targets"])
+            ema_preds = self._convert_preds(ema_preds)
             self.map_metric_ema.update(ema_preds, targets)
 
     def on_validation_epoch_end(self, trainer: Any, pl_module: Any) -> None:
@@ -232,7 +242,8 @@ class COCOEvalCallback(Callback):
             batch_idx: Batch index within the test epoch.
             dataloader_idx: Index of the test dataloader (unused here).
         """
-        preds: list[dict[str, torch.Tensor]] = self._convert_preds(outputs["results"])
+        preds = self._align_pred_labels_to_targets(outputs["results"], outputs["targets"])
+        preds = self._convert_preds(preds)
         targets = self._convert_targets(outputs["targets"])
 
         self.map_metric.update(preds, targets)
@@ -256,6 +267,24 @@ class COCOEvalCallback(Callback):
     # Private helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _sanitize_mean_ap_state_for_ddp(metric: Any) -> None:
+        """Align tensor dtypes in MeanAveragePrecision list states across DDP ranks."""
+        for attr in ("detection_labels", "groundtruth_labels", "groundtruth_crowds"):
+            lst = getattr(metric, attr, None)
+            if not isinstance(lst, list):
+                continue
+            for i, t in enumerate(lst):
+                if isinstance(t, torch.Tensor):
+                    lst[i] = t.long()
+        for attr in ("detection_scores", "detection_box", "groundtruth_box", "groundtruth_area"):
+            lst = getattr(metric, attr, None)
+            if not isinstance(lst, list):
+                continue
+            for i, t in enumerate(lst):
+                if isinstance(t, torch.Tensor):
+                    lst[i] = t.float()
+
     def _compute_and_log(self, trainer: Any, pl_module: Any, split: str) -> None:
         """Shared epoch-end logic for validation and test evaluation loops.
 
@@ -268,6 +297,7 @@ class COCOEvalCallback(Callback):
             pl_module: The LightningModule.
             split: Metric namespace — ``"val"`` or ``"test"``.
         """
+        self._sanitize_mean_ap_state_for_ddp(self.map_metric)
         metrics = self.map_metric.compute()
 
         # torchmetrics prefixes all keys when iou_type is a list (e.g. "bbox_map")
@@ -298,6 +328,7 @@ class COCOEvalCallback(Callback):
         # EMA metrics — computed from a separate EMA forward pass accumulated
         # in on_validation_batch_end, so base and EMA values are independent.
         if self.map_metric_ema is not None:
+            self._sanitize_mean_ap_state_for_ddp(self.map_metric_ema)
             ema_metrics = self.map_metric_ema.compute()
             ema_mar_key = f"{pfx}mar_{self._max_dets}"
             pl_module.log(f"{split}/ema_mAP_50_95", ema_metrics[f"{pfx}map"], prog_bar=True)
@@ -686,6 +717,70 @@ class COCOEvalCallback(Callback):
 
         return "\n".join([title_line, r1, r2, r3, r4, r5, r6, r7])
 
+    @staticmethod
+    def _align_pred_labels_to_targets(
+        preds: list[dict[str, torch.Tensor]],
+        targets: list[dict[str, torch.Tensor]],
+        *,
+        score_thresh: float = 0.05,
+    ) -> list[dict[str, torch.Tensor]]:
+        """Shift prediction class ids so they match dataset label ids for mAP / F1.
+
+        Roboflow COCO loaders often use ``remap_category_ids=True``, producing
+        contiguous **0-based** ground-truth labels.  DETR-style heads may still
+        assign the top-scoring class index **1** for a single foreground class
+        when the linear layer has two outputs (see ``build_model`` in
+        ``lwdetr.py``).  ``torchmetrics.MeanAveragePrecision`` requires matching
+        ids, so we subtract a per-batch offset inferred from high-confidence
+        predictions vs targets (typically ``1`` when preds are ``{1}`` and GT
+        is ``{0}``).
+
+        Args:
+            preds: Raw per-image dicts from ``PostProcess`` (before
+                :meth:`_convert_preds`).
+            targets: Per-image target dicts (same order as ``preds``).
+            score_thresh: Only prediction rows with ``scores > score_thresh``
+                are used to estimate the label offset (defaults to ``0.05``).
+
+        Returns:
+            A shallow-copied list of prediction dicts with ``labels`` adjusted
+            when an offset is detected; otherwise the original ``preds`` list.
+        """
+        pred_chunks: list[torch.Tensor] = []
+        tgt_chunks: list[torch.Tensor] = []
+        for p, t in zip(preds, targets):
+            if "labels" not in p or p["labels"].numel() == 0:
+                continue
+            if "labels" not in t or t["labels"].numel() == 0:
+                continue
+            lab = p["labels"]
+            if "scores" in p and p["scores"].numel() == lab.numel():
+                m = p["scores"] > score_thresh
+                if m.any():
+                    lab = lab[m]
+            pred_chunks.append(lab)
+            tgt_chunks.append(t["labels"])
+
+        if not pred_chunks or not tgt_chunks:
+            return preds
+
+        pred_flat = torch.cat(pred_chunks)
+        tgt_flat = torch.cat(tgt_chunks)
+        delta = int(pred_flat.min().item() - tgt_flat.min().item())
+        if delta == 0:
+            return preds
+        # Guard: only apply small shifts (typical DETR / COCO off-by-one).
+        if delta < -4 or delta > 4:
+            return preds
+
+        out: list[dict[str, torch.Tensor]] = []
+        for p in preds:
+            q = dict(p)
+            if "labels" in q and q["labels"].numel():
+                q["labels"] = q["labels"] - delta
+            out.append(q)
+        return out
+
     def _convert_preds(self, preds: list[dict[str, torch.Tensor]]) -> list[dict[str, torch.Tensor]]:
         """Normalise prediction dicts from ``PostProcess`` for torchmetrics.
 
@@ -710,6 +805,12 @@ class COCOEvalCallback(Callback):
         out = []
         for p in preds:
             entry = dict(p)
+            if "labels" in entry:
+                entry["labels"] = entry["labels"].long()
+            if "scores" in entry:
+                entry["scores"] = entry["scores"].float()
+            if "boxes" in entry:
+                entry["boxes"] = entry["boxes"].float()
             if "masks" in entry and entry["masks"].ndim == 4 and entry["masks"].shape[1] == 1:
                 entry["masks"] = entry["masks"].squeeze(1)
             out.append(entry)
@@ -733,7 +834,7 @@ class COCOEvalCallback(Callback):
             h, w = t["orig_size"].tolist()
             scale = t["boxes"].new_tensor([w, h, w, h])
             boxes = box_cxcywh_to_xyxy(t["boxes"]) * scale
-            entry: dict[str, torch.Tensor] = {"boxes": boxes, "labels": t["labels"]}
+            entry: dict[str, torch.Tensor] = {"boxes": boxes.float(), "labels": t["labels"].long()}
             if "masks" in t:
                 masks = t["masks"].bool()
                 # PostProcess resizes predicted masks to orig_size; resize GT
@@ -750,6 +851,8 @@ class COCOEvalCallback(Callback):
                     )
                 entry["masks"] = masks
             if "iscrowd" in t:
-                entry["iscrowd"] = t["iscrowd"]
+                entry["iscrowd"] = t["iscrowd"].long()
+            if "area" in t:
+                entry["area"] = t["area"].float()
             out.append(entry)
         return out

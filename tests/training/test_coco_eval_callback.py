@@ -185,6 +185,47 @@ class TestOnFitStart:
         assert cb._cat_id_to_name == {1: "fish", 2: "shark"}
 
 
+class TestAlignPredLabels:
+    """_align_pred_labels_to_targets fixes DETR vs remapped-COCO label mismatch."""
+
+    def test_shifts_single_class_pred_one_to_match_gt_zero(self) -> None:
+        """Remapped COCO uses label 0; postprocess may emit label 1 — subtract 1."""
+        preds = [
+            {
+                "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]),
+                "scores": torch.tensor([0.9]),
+                "labels": torch.tensor([1], dtype=torch.long),
+            }
+        ]
+        targets = [
+            {
+                "boxes": torch.tensor([[0.5, 0.5, 0.1, 0.1]]),
+                "labels": torch.tensor([0], dtype=torch.long),
+                "orig_size": torch.tensor([100, 200]),
+            }
+        ]
+        out = COCOEvalCallback._align_pred_labels_to_targets(preds, targets)
+        assert out[0]["labels"].tolist() == [0]
+
+    def test_no_shift_when_already_aligned(self) -> None:
+        preds = [
+            {
+                "boxes": torch.tensor([[0.0, 0.0, 10.0, 10.0]]),
+                "scores": torch.tensor([0.9]),
+                "labels": torch.tensor([0], dtype=torch.long),
+            }
+        ]
+        targets = [
+            {
+                "boxes": torch.tensor([[0.5, 0.5, 0.1, 0.1]]),
+                "labels": torch.tensor([0], dtype=torch.long),
+                "orig_size": torch.tensor([100, 200]),
+            }
+        ]
+        out = COCOEvalCallback._align_pred_labels_to_targets(preds, targets)
+        assert out is preds
+
+
 @pytest.mark.parametrize(
     "hook,stage",
     [

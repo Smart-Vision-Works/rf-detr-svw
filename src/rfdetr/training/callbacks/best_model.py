@@ -51,7 +51,7 @@ class BestModelCallback(ModelCheckpoint):
 
     def __init__(
         self,
-        output_dir: str,
+        output_dir: str | None = None,
         monitor_regular: str = "val/mAP_50_95",
         monitor_ema: str | None = None,
         run_test: bool = True,
@@ -70,9 +70,20 @@ class BestModelCallback(ModelCheckpoint):
         self._monitor_ema = monitor_ema
         self._run_test = run_test
         self._best_ema: float = 0.0
-        self._output_dir = Path(output_dir)
+        self._output_dir: Path | None = Path(output_dir) if output_dir else None
         # Stash current pl_module so _save_checkpoint (no pl_module param) can access it.
         self._current_pl_module: LightningModule | None = None
+
+    def _get_output_dir(self, trainer: Trainer) -> Path:
+        """Resolve output directory lazily from callback dirpath or trainer log_dir."""
+        if self._output_dir is not None:
+            return self._output_dir
+        if self.dirpath:
+            self._output_dir = Path(self.dirpath)
+        else:
+            # Match default ModelCheckpoint location under the active Lightning log dir.
+            self._output_dir = Path(trainer.log_dir) / "checkpoints"
+        return self._output_dir
 
     @staticmethod
     def _build_checkpoint_payload(
@@ -248,6 +259,9 @@ class BestModelCallback(ModelCheckpoint):
         # logged this epoch (non-eval epochs with eval_interval > 1 skip COCO eval
         # so the key is absent from callback_metrics).
         if self.monitor not in trainer.callback_metrics:
+            # DDP: ModelCheckpoint paths can call trainer.strategy.barrier(); all ranks must run the same
+            # on_validation_end branch or non-zero ranks skip the barrier and training hangs.
+            super().on_validation_end(trainer, pl_module)
             return
         super().on_validation_end(trainer, pl_module)
 
@@ -257,7 +271,8 @@ class BestModelCallback(ModelCheckpoint):
         ema_val = trainer.callback_metrics.get(self._monitor_ema, torch.tensor(0.0)).item()
         if ema_val > self._best_ema:
             self._best_ema = ema_val
-            self._output_dir.mkdir(parents=True, exist_ok=True)
+            output_dir = self._get_output_dir(trainer)
+            output_dir.mkdir(parents=True, exist_ok=True)
             ema_state_dict = self._get_ema_model_state_dict(trainer, pl_module)
             # Enrich train_config with dataset class names so reloaded checkpoints
             # return the correct labels, not COCO defaults (#509).
@@ -275,7 +290,7 @@ class BestModelCallback(ModelCheckpoint):
             ema_model_name = self._resolve_model_name(pl_module)
             torch.save(
                 self._build_checkpoint_payload(ema_state_dict, ema_args_dict, trainer, model_name=ema_model_name),
-                self._output_dir / "checkpoint_best_ema.pth",
+                output_dir / "checkpoint_best_ema.pth",
             )
             logger.info(
                 "Best EMA mAP improved to %.4f (epoch %d)",
@@ -299,8 +314,9 @@ class BestModelCallback(ModelCheckpoint):
 
         best_regular = self.best_model_score.item() if self.best_model_score is not None else 0.0
         regular_path = Path(self.best_model_path) if self.best_model_path else None
-        ema_path = self._output_dir / "checkpoint_best_ema.pth"
-        total_path = self._output_dir / "checkpoint_best_total.pth"
+        output_dir = self._get_output_dir(trainer)
+        ema_path = output_dir / "checkpoint_best_ema.pth"
+        total_path = output_dir / "checkpoint_best_total.pth"
 
         # Strict > for EMA to win (matches legacy behaviour).
         best_is_ema = self._best_ema > best_regular
@@ -407,7 +423,11 @@ class RFDETREarlyStopping(EarlyStopping):
         ema_val: float | None = ema_tensor.item() if ema_tensor is not None else None
 
         if regular_val is None and ema_val is None:
-            return  # No metrics available — skip (matches legacy noop behaviour).
+            # DDP: must still invoke EarlyStopping.on_validation_end on every rank. If we return early without
+            # super(), another rank may call reduce_boolean_decision() and hang. Parent short-circuits when the
+            # synthetic monitor key is absent (no collective).
+            super().on_validation_end(trainer, pl_module)
+            return
 
         if self._use_ema and ema_val is not None:
             effective = ema_val
