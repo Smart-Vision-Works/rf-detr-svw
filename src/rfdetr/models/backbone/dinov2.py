@@ -97,6 +97,8 @@ class DinoV2(nn.Module):
 
             dino_config = get_config(size, use_registers)
 
+            # Hugging Face deprecates ``use_return_dict`` on configs; prefer ``return_dict`` only.
+            dino_config.pop("use_return_dict", None)
             dino_config["return_dict"] = False
             dino_config["out_features"] = [f"stage{i}" for i in out_feature_indexes]
             dino_config["drop_path_rate"] = drop_path_rate
